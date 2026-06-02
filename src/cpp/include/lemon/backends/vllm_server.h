@@ -2,6 +2,7 @@
 
 #include "../wrapped_server.h"
 #include "backend_utils.h"
+#include <filesystem>
 #include <string>
 
 namespace lemon {
@@ -35,6 +36,9 @@ public:
     json chat_completion(const json& request) override;
     json completion(const json& request) override;
     json responses(const json& request) override;
+    
+private:
+    std::filesystem::path rocm_shim_dir_;
 };
 
 } // namespace backends
