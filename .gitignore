@@ -189,3 +189,7 @@ CLAUDE.local.md
 # WiX Toolset build artifacts
 *.msi
 *.wixpdb
+
+# Visual Studio build artifacts
+/.vs/
+/build-debug/
