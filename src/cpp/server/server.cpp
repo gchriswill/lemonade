@@ -2,6 +2,8 @@
 #include <optional>
 #include "lemon/collection_orchestrator.h"
 #include "lemon/hf_variants.h"
+#include "lemon/model_registry.h"
+#include "lemon/route_decision_response.h"
 #include "lemon/routing_classifier_services.h"
 #include "lemon/routing_policy.h"
 #include "lemon/config_file.h"
@@ -186,6 +188,50 @@ void set_error_response(const json& response, httplib::Response& res,
                         int default_status_code = 500) {
     res.status = get_error_status_code(response, default_status_code);
     res.set_content(response.dump(), "application/json");
+}
+
+void attach_route_decision(json& response, httplib::Response& res,
+                           const std::optional<RouterDispatchResult>& dispatch) {
+    if (!dispatch.has_value()) {
+        return;
+    }
+    response["x_lemonade_route"] = route_decision_to_json(dispatch->decision);
+    attach_route_header(res, dispatch->decision);
+}
+
+template <typename StreamFn>
+void set_route_decision_sse_content_provider(
+    httplib::Response& res,
+    const std::optional<RouterDispatchResult>& dispatch,
+    std::string request_body,
+    StreamFn stream_fn) {
+    res.set_header("Cache-Control", "no-cache");
+    res.set_header("Connection", "keep-alive");
+    res.set_header("X-Accel-Buffering", "no");
+    if (dispatch) {
+        attach_route_header(res, dispatch->decision);
+    }
+
+    json route_decision_json = dispatch
+        ? route_decision_to_json(dispatch->decision)
+        : json(nullptr);
+    res.set_chunked_content_provider(
+        "text/event-stream",
+        [request_body = std::move(request_body),
+         route_decision_json = std::move(route_decision_json),
+         stream_fn = std::move(stream_fn)](size_t offset, httplib::DataSink& sink) {
+            if (offset > 0) {
+                return false;
+            }
+
+            stream_with_route_decision(
+                sink,
+                route_decision_json,
+                [&request_body, &stream_fn](httplib::DataSink& route_sink) {
+                    stream_fn(request_body, route_sink);
+                });
+            return false;
+        });
 }
 
 int get_http_status_from_error(const std::string& error_code) {
@@ -400,15 +446,21 @@ void Server::start_model_cache_warmup() {
             LOG(WARNING, "Server") << "Model list cache warmup failed with unknown error" << std::endl;
         }
 
-        try {
-            LOG(DEBUG, "Server") << "Checking downloaded models for updates..." << std::endl;
-            model_manager_->check_for_model_updates();
-            LOG(DEBUG, "Server") << "Model update check complete" << std::endl;
-        } catch (const std::exception& e) {
-            LOG(WARNING, "Server") << "Model update check failed: " << e.what() << std::endl;
-        } catch (...) {
-            LOG(WARNING, "Server") << "Model update check failed with unknown error" << std::endl;
+        if (config_->auto_check_model_updates()) {
+            try {
+                LOG(DEBUG, "Server") << "Checking downloaded models for updates..." << std::endl;
+                (void)model_manager_->check_for_model_updates();
+                LOG(DEBUG, "Server") << "Model update check complete" << std::endl;
+            } catch (const std::exception& e) {
+                LOG(WARNING, "Server") << "Model update check failed: " << e.what() << std::endl;
+            } catch (...) {
+                LOG(WARNING, "Server") << "Model update check failed with unknown error" << std::endl;
+            }
+        } else {
+            LOG(DEBUG, "Server")
+                << "Automatic model update checks are disabled" << std::endl;
         }
+
         update_check_done_ = true;
     });
 }
@@ -445,9 +497,16 @@ void Server::setup_http_servers() {
     // CRITICAL: Enable multi-threading so the server can handle concurrent requests
     // Without this, the server is single-threaded and blocks on long operations
 
-    std::function<httplib::TaskQueue *(void)> task_queue_factory = [this] {
-        LOG(DEBUG, "Server") << "Creating new thread pool with 8 threads" << std::endl;
-        return new httplib::ThreadPool(8);
+    // Size the pool from the host CPU count instead of a fixed 8. cpp-httplib
+    // dedicates one worker thread per in-flight request for the connection's
+    // lifetime, so a small fixed pool lets a handful of slow-loris or long-lived
+    // streaming connections starve the management endpoints (/health, /load).
+    unsigned int hw = std::thread::hardware_concurrency();
+    size_t thread_count = std::clamp<size_t>(static_cast<size_t>(hw) * 4, 32, 256);
+    std::function<httplib::TaskQueue *(void)> task_queue_factory = [thread_count] {
+        LOG(DEBUG, "Server") << "Creating new thread pool with " << thread_count
+                             << " threads" << std::endl;
+        return new httplib::ThreadPool(thread_count);
     };
 
     // The fronts own the accept loops (and therefore the task queues)
@@ -455,6 +514,22 @@ void Server::setup_http_servers() {
     http_front_v6_->new_task_queue = task_queue_factory;
     http_server_->new_task_queue = task_queue_factory;
     http_server_v6_->new_task_queue = task_queue_factory;
+
+    // Bound how long a single connection can tie up a worker thread. Without a
+    // read timeout a client that opens a socket and never finishes its request
+    // (slow loris) holds its worker indefinitely. Streaming responses drive
+    // their own write cadence, so keep the write timeout generous. The fronts
+    // need the same limits: they own accept and run the WebSocket upgrade peek
+    // before delegating, so a stalled client could otherwise hold a front
+    // worker there.
+    for (httplib::Server* srv : {static_cast<httplib::Server*>(http_front_.get()),
+                                 static_cast<httplib::Server*>(http_front_v6_.get()),
+                                 static_cast<httplib::Server*>(http_server_.get()),
+                                 static_cast<httplib::Server*>(http_server_v6_.get())}) {
+        srv->set_read_timeout(30, 0);
+        srv->set_write_timeout(300, 0);
+        srv->set_keep_alive_max_count(100);
+    }
 
     setup_routes(*http_server_);
     setup_routes(*http_server_v6_);
@@ -627,6 +702,11 @@ void Server::setup_routes(httplib::Server &web_server) {
     // Models endpoints
     register_get("models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
+    });
+
+    // Explicit network action for users who disable startup update checks.
+    register_post("models/check-updates", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_model_update_check(req, res);
     });
 
     // Model files endpoint for the Files tab. Register before the generic
@@ -924,6 +1004,8 @@ void Server::setup_static_files(httplib::Server &web_server) {
                 {"recipe", info.recipe},
                 {"labels", info.labels},
                 {"suggested", info.suggested},
+                {"source", info.source.empty() ? info.registry_source : info.source},
+                {"registry_source", info.registry_source},
                 {"components", public_components},
                 {"mmproj", info.mmproj()}
             };
@@ -1781,13 +1863,44 @@ nlohmann::json Server::create_model_error(const std::string& requested_model, co
 // Behavior:
 //   1. If model is already loaded: Return immediately (no-op)
 //   2. If model is not downloaded: Download it (first-time use)
-//   3. If model is downloaded: Use cached version (don't check HuggingFace for updates)
+//   3. If model is downloaded: Use cached version
+//      (do not check the remote registry for updates)
 //
-// Note: Only the /pull endpoint checks HuggingFace for updates (do_not_upgrade=false)
-void Server::auto_load_model_if_needed(const std::string& requested_model) {
+// Note: Only the /pull endpoint checks the model's recorded registry for
+// updates (do_not_upgrade=false).
+
+// Load-level options that may be forwarded to RecipeOptions during auto-load.
+// Keep this an explicit allowlist so request-scoped fields do not leak into
+// recipe options.
+nlohmann::json Server::extract_auto_load_options(const json& request) {
+    nlohmann::json result = json::object();
+
+    auto extract_if_present =
+        [&request, &result](const std::string& key) {
+            if (request.contains(key)) {
+                result[key] = request[key];
+            }
+        };
+
+    extract_if_present("ctx_size");
+
+    return result;
+}
+
+void Server::auto_load_model_if_needed(
+    const std::string& requested_model,
+    const json& request_options) {
     // Check if this specific model is already loaded (multi-model aware)
     if (router_->is_model_loaded(requested_model)) {
-        LOG(INFO, "Server") << "Model already loaded: " << requested_model << std::endl;
+        LOG(DEBUG, "Server") << "Model already loaded: " << requested_model << std::endl;
+        if (request_options.contains("ctx_size")) {
+            auto loaded_ctx = router_->get_model_recipe_options(requested_model)
+                                  .get_option("ctx_size");
+            LOG(DEBUG, "Server")
+                << "Ignoring requested ctx_size=" << request_options["ctx_size"]
+                << " for already-loaded " << requested_model
+                << " (loaded ctx_size=" << loaded_ctx << ")" << std::endl;
+        }
         return;
     }
 
@@ -1808,14 +1921,17 @@ void Server::auto_load_model_if_needed(const std::string& requested_model) {
     }
 
     // Download model if not cached (first-time use)
-    // IMPORTANT: Use do_not_upgrade=true to prevent checking HuggingFace for updates
+    // IMPORTANT: Use do_not_upgrade=true to prevent checking the remote registry for updates
     // This means:
-    //   - If model is NOT downloaded: Download it from HuggingFace
-    //   - If model IS downloaded: Skip HuggingFace API check entirely (use cached version)
+    //   - If model is NOT downloaded: Download it from its recorded registry
+    //   - If model IS downloaded: Skip the registry API check entirely (use cached version)
     // Only the /pull endpoint should check for updates (uses do_not_upgrade=false)
     if (!model_manager_->backend_self_manages_downloads(info.recipe) &&
         !model_manager_->is_model_downloaded(requested_model)) {
-        LOG(INFO, "Server") << "Model not cached, downloading from Hugging Face..." << std::endl;
+        LOG(INFO, "Server") << "Model not cached, downloading from "
+                            << remote_registry_display_name(
+                                   parse_remote_registry_source(info.registry_source))
+                            << "..." << std::endl;
         LOG(INFO, "Server") << "This may take several minutes for large models." << std::endl;
         model_manager_->download_registered_model(info, true);
         LOG(INFO, "Server") << "Model download complete: " << requested_model << std::endl;
@@ -1825,10 +1941,10 @@ void Server::auto_load_model_if_needed(const std::string& requested_model) {
         info = model_manager_->get_model_info(requested_model);
     }
 
-    // Load model with do_not_upgrade=true
+    // Load model with do_not_upgrade=true, applying per-request options on first load.
     // For FLM models: FastFlowLMServer will handle download internally if needed
     // For non-FLM models: Model should already be cached at this point
-    router_->load_model(requested_model, info, RecipeOptions(info.recipe, json::object()), true);
+    router_->load_model(requested_model, info, RecipeOptions(info.recipe, request_options), true);
     LOG(INFO, "Server") << "Model loaded successfully: " << requested_model << std::endl;
 }
 
@@ -1840,7 +1956,7 @@ void Server::ensure_collection_loaded(const ModelInfo& info) {
             continue;
         }
         if (router_->is_model_loaded(component)) {
-            LOG(INFO, "Server") << "Component already loaded: " << component << std::endl;
+            LOG(DEBUG, "Server") << "Component already loaded: " << component << std::endl;
             continue;
         }
         auto comp_info = model_manager_->get_model_info(component);
@@ -1931,6 +2047,36 @@ void Server::handle_live(const httplib::Request& req, httplib::Response& res) {
     res.status = 200;
 }
 
+void Server::handle_model_update_check(const httplib::Request& req, httplib::Response& res) {
+    (void)req;
+
+    // A manual check is intentionally independent from
+    // auto_check_model_updates, but full offline mode remains authoritative.
+    if (config_->offline()) {
+        res.status = 409;
+        res.set_content(
+            nlohmann::json{{"error", "Cannot check model updates while offline=true"}}.dump(),
+            "application/json");
+        return;
+    }
+
+    try {
+        auto updated_models = model_manager_->check_for_model_updates();
+        nlohmann::json response = {
+            {"status", "success"},
+            {"updates_available", updated_models.size()},
+            {"models", updated_models}
+        };
+        res.set_content(response.dump(), "application/json");
+    } catch (const std::exception& e) {
+        LOG(WARNING, "Server") << "Manual model update check failed: " << e.what() << std::endl;
+        res.status = 500;
+        res.set_content(
+            nlohmann::json{{"error", std::string("Model update check failed: ") + e.what()}}.dump(),
+            "application/json");
+    }
+}
+
 void Server::handle_models(const httplib::Request& req, httplib::Response& res) {
     // For HEAD requests, just return 200 OK without processing
     if (req.method == "HEAD") {
@@ -1985,6 +2131,8 @@ nlohmann::json Server::model_info_to_json(const std::string& model_id, const Mod
         {"downloaded", info.downloaded},
         {"update_available", info.update_available},
         {"suggested", info.suggested},
+        {"source", info.source.empty() ? info.registry_source : info.source},
+        {"registry_source", info.registry_source},
         {"labels", info.labels},
         {"components", public_components},
         {"recipe_options", info.recipe_options.to_json()},
@@ -2189,8 +2337,9 @@ void Server::handle_collection_chat_completions(const nlohmann::json& request_js
     res.set_content(response.dump(), "application/json");
 }
 
-std::optional<std::string> Server::route_collection_request(const nlohmann::json& request_json,
-                                             const ModelInfo& collection_info) {
+std::optional<RouterDispatchResult> Server::route_collection_request(
+    const nlohmann::json& request_json,
+    const ModelInfo& collection_info) {
     // The policy is parsed once when the models cache is built (ModelManager),
     // so dispatch just reads it here. A missing policy means the collection
     // failed to parse at cache-build time; return nullopt so the caller leaves
@@ -2210,34 +2359,44 @@ std::optional<std::string> Server::route_collection_request(const nlohmann::json
     RoutingPolicyEngine engine(std::move(policy), std::move(services));
 
     RouteContext ctx = build_route_context(request_json, collection_info.model_name);
-    Decision decision = engine.route(ctx, /*want_trace=*/false);
-    return decision.route_to;
+    const bool want_trace = request_json.value("route_trace", false);
+    Decision decision = engine.route(ctx, want_trace);
+    RouterDispatchResult result;
+    result.requested_model = collection_info.model_name;
+    result.selected_model = decision.route_to;
+    result.decision = std::move(decision);
+    return result;
 }
 
-void Server::apply_router_collection_dispatch(nlohmann::json& request_json) {
+std::optional<RouterDispatchResult> Server::apply_router_collection_dispatch(
+    nlohmann::json& request_json) {
     if (!request_json.contains("model") || !request_json["model"].is_string()) {
-        return;
+        return std::nullopt;
     }
     const std::string requested_model = request_json["model"].get<std::string>();
     try {
         if (!model_manager_->model_exists(requested_model)) {
-            return;
+            return std::nullopt;
         }
         ModelInfo info = model_manager_->get_model_info(requested_model);
         if (!is_router_collection_recipe(info.recipe)) {
-            return;
+            return std::nullopt;
         }
-        std::optional<std::string> selected = route_collection_request(request_json, info);
-        if (!selected) {
-            return;
+        auto dispatch = route_collection_request(request_json, info);
+        if (!dispatch) {
+            return std::nullopt;
         }
+        dispatch->requested_model = requested_model;
         LOG(INFO, "Server") << "Router collection '" << requested_model << "' -> '"
-                            << *selected << "'" << std::endl;
-        request_json["model"] = *selected;
+                            << dispatch->selected_model << "'" << std::endl;
+        request_json["model"] = dispatch->selected_model;
+        request_json.erase("route_trace");
+        return dispatch;
     } catch (const std::exception& e) {
         LOG(WARNING, "Server") << "Router collection dispatch failed for '"
                                << requested_model << "': " << e.what() << std::endl;
     }
+    return std::nullopt;
 }
 
 void Server::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
@@ -2259,6 +2418,7 @@ void Server::handle_chat_completions(const httplib::Request& req, httplib::Respo
         }
 
         bool request_modified = false;
+        std::optional<RouterDispatchResult> route_dispatch;
 
         // Omni "collection" models run a server-side tool-calling loop instead of a
         // plain completion. Branch before auto-load/LLM-type checks: the collection
@@ -2276,12 +2436,13 @@ void Server::handle_chat_completions(const httplib::Request& req, httplib::Respo
                         // The recipe is the trigger (no "auto", no /v1/route): run the
                         // routing engine and rewrite the model to the selected
                         // candidate, then fall through to normal completion handling.
-                        std::optional<std::string> selected =
-                            route_collection_request(request_json, info);
-                        if (selected) {
+                        route_dispatch = route_collection_request(request_json, info);
+                        if (route_dispatch) {
+                            route_dispatch->requested_model = requested_model;
                             LOG(INFO, "Server") << "Router collection '" << requested_model
-                                                << "' -> '" << *selected << "'" << std::endl;
-                            request_json["model"] = *selected;
+                                                << "' -> '" << route_dispatch->selected_model << "'" << std::endl;
+                            request_json["model"] = route_dispatch->selected_model;
+                            request_json.erase("route_trace");
                         }
                     }
                 }
@@ -2300,7 +2461,7 @@ void Server::handle_chat_completions(const httplib::Request& req, httplib::Respo
         // Handle model loading/switching
         if (request_json.contains("model")) {
             try {
-                auto_load_model_if_needed(requested_model);
+                auto_load_model_if_needed(requested_model, extract_auto_load_options(request_json));
                 if (span) {
                     span->cancel();
                 }
@@ -2368,25 +2529,13 @@ void Server::handle_chat_completions(const httplib::Request& req, httplib::Respo
                 // Log the HTTP request
                 LOG(INFO, "Server") << "POST /api/v1/chat/completions - Streaming" << std::endl;
 
-                // Set up streaming response with SSE headers
-                res.set_header("Cache-Control", "no-cache");
-                res.set_header("Connection", "keep-alive");
-                res.set_header("X-Accel-Buffering", "no"); // Disable nginx buffering
-
-                // Use cpp-httplib's chunked content provider for SSE streaming
-                res.set_chunked_content_provider(
-                    "text/event-stream",
-                    [this, request_body](size_t offset, httplib::DataSink& sink) {
-                        // For chunked responses, offset tracks bytes sent so far
-                        // We only want to stream once when offset is 0
-                        if (offset > 0) {
-                            return false; // We're done after the first call
-                        }
-
-                        router_->chat_completion_stream(request_body, sink);
-                        return false;
-                    }
-                );
+                set_route_decision_sse_content_provider(
+                    res,
+                    route_dispatch,
+                    request_body,
+                    [this](const std::string& body, httplib::DataSink& sink) {
+                        router_->chat_completion_stream(body, sink);
+                    });
             } catch (const std::exception& e) {
                 LOG(ERROR, "Server") << "Streaming failed: " << e.what() << std::endl;
                 res.status = 500;
@@ -2404,6 +2553,7 @@ void Server::handle_chat_completions(const httplib::Request& req, httplib::Respo
                 return;
             }
 
+            attach_route_decision(response, res, route_dispatch);
             // Debug: Check if response contains tool_calls
             if (response.contains("choices") && response["choices"].is_array() && !response["choices"].empty()) {
                 auto& first_choice = response["choices"][0];
@@ -2536,7 +2686,8 @@ void Server::handle_completions(const httplib::Request& req, httplib::Response& 
 
         // A collection.router model flips this endpoint into engine mode: pick a
         // candidate and rewrite the model before the usual load/forward logic.
-        apply_router_collection_dispatch(request_json);
+        std::optional<RouterDispatchResult> route_dispatch =
+            apply_router_collection_dispatch(request_json);
 
         std::string requested_model;
         if (request_json.contains("model") && request_json["model"].is_string()) {
@@ -2547,7 +2698,7 @@ void Server::handle_completions(const httplib::Request& req, httplib::Response& 
         // Handle model loading/switching (same logic as chat_completions)
         if (request_json.contains("model")) {
             try {
-                auto_load_model_if_needed(requested_model);
+                auto_load_model_if_needed(requested_model, extract_auto_load_options(request_json));
                 if (span) {
                     span->cancel();
                 }
@@ -2601,24 +2752,13 @@ void Server::handle_completions(const httplib::Request& req, httplib::Response& 
                 // Log the HTTP request
                 LOG(INFO, "Server") << "POST /api/v1/completions - Streaming" << std::endl;
 
-                // Set up SSE headers
-                res.set_header("Cache-Control", "no-cache");
-                res.set_header("Connection", "keep-alive");
-                res.set_header("X-Accel-Buffering", "no");
-
-                res.set_chunked_content_provider(
-                    "text/event-stream",
-                    [this, request_body](size_t offset, httplib::DataSink& sink) {
-                        if (offset > 0) {
-                            return false; // Already sent everything
-                        }
-
-                        // Use unified Router path for streaming
-                        router_->completion_stream(request_body, sink);
-
-                        return false;
-                    }
-                );
+                set_route_decision_sse_content_provider(
+                    res,
+                    route_dispatch,
+                    request_body,
+                    [this](const std::string& body, httplib::DataSink& sink) {
+                        router_->completion_stream(body, sink);
+                    });
 
                 LOG(INFO, "Server") << "Streaming completed - 200 OK" << std::endl;
                 return;
@@ -2649,6 +2789,7 @@ void Server::handle_completions(const httplib::Request& req, httplib::Response& 
                 return;
             }
 
+            attach_route_decision(response, res, route_dispatch);
             res.set_content(response.dump(), "application/json");
 
             // Print and save telemetry for non-streaming completions
@@ -2763,7 +2904,7 @@ void Server::handle_embeddings(const httplib::Request& req, httplib::Response& r
         // Handle model loading/switching using helper function
         if (request_json.contains("model")) {
             try {
-                auto_load_model_if_needed(requested_model);
+                auto_load_model_if_needed(requested_model, extract_auto_load_options(request_json));
                 if (span) {
                     span->cancel();
                 }
@@ -2818,7 +2959,7 @@ void Server::handle_reranking(const httplib::Request& req, httplib::Response& re
         // Handle model loading/switching using helper function
         if (request_json.contains("model")) {
             try {
-                auto_load_model_if_needed(requested_model);
+                auto_load_model_if_needed(requested_model, extract_auto_load_options(request_json));
                 if (span) {
                     span->cancel();
                 }
@@ -3061,7 +3202,7 @@ void Server::handle_audio_transcriptions(const httplib::Request& req, httplib::R
         if (request_json.contains("model")) {
             std::string requested_model = request_json["model"];
             try {
-                auto_load_model_if_needed(requested_model);
+                auto_load_model_if_needed(requested_model, extract_auto_load_options(request_json));
             } catch (const std::exception& e) {
                 LOG(ERROR, "Server") << "Failed to load audio model: " << e.what() << std::endl;
                 auto error_response = create_model_error(requested_model, e.what());
@@ -3110,7 +3251,7 @@ void Server::handle_audio_speech(const httplib::Request& req, httplib::Response&
         if (request_json.contains("model")) {
             std::string requested_model = request_json["model"];
             try {
-                auto_load_model_if_needed(requested_model);
+                auto_load_model_if_needed(requested_model, extract_auto_load_options(request_json));
             } catch (const std::exception& e) {
                 LOG(ERROR, "Server") << "Failed to load text-to-speech model: " << e.what() << std::endl;
                 auto error_response = create_model_error(requested_model, e.what());
@@ -3309,10 +3450,19 @@ void Server::handle_audio_generations(const httplib::Request& req, httplib::Resp
                 {"type", "invalid_request_error"}}}}.dump(), "application/json");
             return;
         }
+        for (const auto* field : {"lyrics", "vocal_language"}) {
+            if (request_json.contains(field) && !request_json[field].is_string()) {
+                res.status = 400;
+                res.set_content(nlohmann::json{{"error", {
+                    {"message", "'" + std::string(field) + "' must be a string"},
+                    {"type", "invalid_request_error"}}}}.dump(), "application/json");
+                return;
+            }
+        }
 
         std::string requested_model = request_json["model"];
         try {
-            auto_load_model_if_needed(requested_model);
+            auto_load_model_if_needed(requested_model, extract_auto_load_options(request_json));
         } catch (const std::exception& e) {
             LOG(ERROR, "Server") << "Failed to load audio-generation model: " << e.what() << std::endl;
             auto error_response = create_model_error(requested_model, e.what());
@@ -3435,7 +3585,7 @@ void Server::handle_3d_generations(const httplib::Request& req, httplib::Respons
 
         std::string requested_model = request_json["model"];
         try {
-            auto_load_model_if_needed(requested_model);
+            auto_load_model_if_needed(requested_model, extract_auto_load_options(request_json));
         } catch (const std::exception& e) {
             LOG(ERROR, "Server") << "Failed to load 3D-generation model: " << e.what() << std::endl;
             auto error_response = create_model_error(requested_model, e.what());
@@ -3487,7 +3637,7 @@ void Server::handle_image_generations(const httplib::Request& req, httplib::Resp
         std::string requested_model = request_json["model"];
 
         try {
-            auto_load_model_if_needed(requested_model);
+            auto_load_model_if_needed(requested_model, extract_auto_load_options(request_json));
         } catch (const std::exception& e) {
             LOG(ERROR, "Server") << "Failed to load image model: " << e.what() << std::endl;
             auto error_response = create_model_error(requested_model, e.what());
@@ -3589,7 +3739,7 @@ bool Server::load_image_model(const nlohmann::json& request_json, httplib::Respo
     }
     std::string requested_model = request_json["model"];
     try {
-        auto_load_model_if_needed(requested_model);
+        auto_load_model_if_needed(requested_model, extract_auto_load_options(request_json));
     } catch (const std::exception& e) {
         LOG(ERROR, "Server") << "Failed to load image model: " << e.what() << std::endl;
         auto error_response = create_model_error(requested_model, e.what());
@@ -3828,7 +3978,7 @@ void Server::handle_image_upscale(const httplib::Request& req, httplib::Response
             auto info = model_manager_->get_model_info(upscale_model_name);
 
             if (!model_manager_->is_model_downloaded(upscale_model_name)) {
-                LOG(INFO, "Server") << "Upscale model not cached, downloading from Hugging Face..." << std::endl;
+                LOG(INFO, "Server") << "Upscale model not cached, downloading from its remote registry..." << std::endl;
                 model_manager_->download_registered_model(info, true);
                 LOG(INFO, "Server") << "Upscale model download complete: " << upscale_model_name << std::endl;
                 info = model_manager_->get_model_info(upscale_model_name);
@@ -3982,13 +4132,14 @@ void Server::handle_responses(const httplib::Request& req, httplib::Response& re
 
         // A collection.router model flips this endpoint into engine mode: pick a
         // candidate and rewrite the model before the usual load/forward logic.
-        apply_router_collection_dispatch(request_json);
+        std::optional<RouterDispatchResult> route_dispatch =
+            apply_router_collection_dispatch(request_json);
 
         // Handle model loading/switching using helper function
         if (request_json.contains("model")) {
             std::string requested_model = request_json["model"];
             try {
-                auto_load_model_if_needed(requested_model);
+                auto_load_model_if_needed(requested_model, extract_auto_load_options(request_json));
             } catch (const std::exception& e) {
                 LOG(ERROR, "Server") << "Failed to load model: " << e.what() << std::endl;
                 auto error_response = create_model_error(requested_model, e.what());
@@ -4015,25 +4166,13 @@ void Server::handle_responses(const httplib::Request& req, httplib::Response& re
             try {
                 LOG(INFO, "Server") << "POST /api/v1/responses - Streaming" << std::endl;
 
-                // Set up streaming response with SSE headers
-                res.set_header("Cache-Control", "no-cache");
-                res.set_header("Connection", "keep-alive");
-                res.set_header("X-Accel-Buffering", "no");
-
-                // Use cpp-httplib's chunked content provider for SSE streaming
-                res.set_chunked_content_provider(
-                    "text/event-stream",
-                    [this, request_body](size_t offset, httplib::DataSink& sink) {
-                        if (offset > 0) {
-                            return false; // Only stream once
-                        }
-
-                        // Use unified Router path for streaming
-                        router_->responses_stream(request_body, sink);
-
-                        return false;
-                    }
-                );
+                set_route_decision_sse_content_provider(
+                    res,
+                    route_dispatch,
+                    request_body,
+                    [this](const std::string& body, httplib::DataSink& sink) {
+                        router_->responses_stream(body, sink);
+                    });
             } catch (const std::exception& e) {
                 LOG(ERROR, "Server") << "Streaming failed: " << e.what() << std::endl;
                 res.status = 500;
@@ -4050,6 +4189,7 @@ void Server::handle_responses(const httplib::Request& req, httplib::Response& re
                 return;
             }
 
+            attach_route_decision(response, res, route_dispatch);
             LOG(INFO, "Server") << "200 OK" << std::endl;
             res.set_content(response.dump(), "application/json");
         }
@@ -4103,6 +4243,52 @@ void Server::handle_pull(const httplib::Request& req, httplib::Response& res) {
         bool do_not_upgrade = request_json.value("do_not_upgrade", false);
         bool stream = request_json.value("stream", false);
         bool subscribe = request_json.value("subscribe", true);
+        bool local_import = request_json.value("local_import", false);
+
+        // Validate and canonicalize remote-registry provenance before anything is
+        // persisted. `source` remains backward-compatible with local origins, while
+        // remote registrations store a canonical huggingface/modelscope value.
+        if (request_json.contains("source") || request_json.contains("registry_source")) {
+            try {
+                std::optional<std::string> normalized_registry;
+                if (request_json.contains("registry_source")) {
+                    normalized_registry = remote_registry_source_name(
+                        parse_remote_registry_source(
+                            request_json["registry_source"].get<std::string>()));
+                }
+
+                if (request_json.contains("source")) {
+                    const std::string public_source = request_json["source"].get<std::string>();
+                    if (is_remote_registry_source(public_source)) {
+                        const std::string normalized_public = remote_registry_source_name(
+                            parse_remote_registry_source(public_source));
+                        if (normalized_registry && *normalized_registry != normalized_public) {
+                            bad_request("'source' and 'registry_source' must identify the same registry");
+                            return;
+                        }
+                        normalized_registry = normalized_public;
+                        request_json["source"] = normalized_public;
+                    } else if (!local_import && public_source != "local_upload" &&
+                               public_source != "local_path" &&
+                               public_source != "extra_models_dir") {
+                        bad_request("Unsupported model source '" + public_source +
+                                    "' (expected 'huggingface' or 'modelscope')");
+                        return;
+                    }
+                }
+
+                if (normalized_registry) {
+                    if (!request_json.contains("source") ||
+                        is_remote_registry_source(request_json["source"].get<std::string>())) {
+                        request_json["source"] = *normalized_registry;
+                    }
+                    request_json["registry_source"] = *normalized_registry;
+                }
+            } catch (const std::exception& e) {
+                bad_request(e.what());
+                return;
+            }
+        }
 
         LOG(INFO, "Server") << "Pulling model: " << model_name << std::endl;
         if (!checkpoint.empty()) {
@@ -4144,7 +4330,7 @@ void Server::handle_pull(const httplib::Request& req, httplib::Response& res) {
             // A body carrying a `models` array is a collection file import: its
             // components may not be registered yet (download_model registers them
             // from the embedded definitions and canonicalizes the list itself).
-            // A pointer body (HF-backed collection) has no `components` at all —
+            // A pointer body (registry-backed collection) has no `components` at all —
             // they come from the downloaded manifest. Only pre-canonicalize an
             // inline `components` list whose entries must already exist.
             if (request_json.contains("components") && request_json["components"].is_array() &&
@@ -4160,7 +4346,6 @@ void Server::handle_pull(const httplib::Request& req, httplib::Response& res) {
         }
 
         // Local import mode: CLI has already copied files to HF cache, just resolve and register
-        bool local_import = request_json.value("local_import", false);
         if (local_import) {
             std::string hf_cache = model_manager_->get_hf_cache_dir();
             std::string model_name_clean = model_name.substr(5); // Remove "user." prefix
@@ -4246,10 +4431,13 @@ void Server::handle_pull_variants(const httplib::Request& req, httplib::Response
         if (checkpoint.find('/') == std::string::npos) {
             res.status = 400;
             nlohmann::json error = {{"error",
-                "Malformed 'checkpoint': expected a Hugging Face repo id of the form 'owner/name'"}};
+                "Malformed 'checkpoint': expected a repository id of the form 'owner/name'"}};
             res.set_content(error.dump(), "application/json");
             return;
         }
+        const std::string source = req.has_param("source")
+            ? req.get_param_value("source") : "huggingface";
+        const auto parsed_source = parse_remote_registry_source(source);
         if (config_->offline()) {
             res.status = 400;
             nlohmann::json error = {{"error", "Lemond is in offline mode, models not downloaded"}, {"code", "lemond_offline"}};
@@ -4257,14 +4445,20 @@ void Server::handle_pull_variants(const httplib::Request& req, httplib::Response
             return;
         }
         bool not_found = false;
-        nlohmann::json body = lemon::fetch_pull_variants(checkpoint, not_found);
+        nlohmann::json body = lemon::fetch_pull_variants(
+            checkpoint, remote_registry_source_name(parsed_source), not_found);
         if (not_found) {
             res.status = 404;
-            nlohmann::json error = {{"error", "Checkpoint '" + checkpoint + "' not found on Hugging Face"}};
+            nlohmann::json error = {{"error", "Checkpoint '" + checkpoint + "' not found on " +
+                remote_registry_display_name(parsed_source)}};
             res.set_content(error.dump(), "application/json");
             return;
         }
         res.set_content(body.dump(), "application/json");
+    } catch (const std::invalid_argument& e) {
+        res.status = 400;
+        nlohmann::json error = {{"error", e.what()}};
+        res.set_content(error.dump(), "application/json");
     } catch (const std::exception& e) {
         LOG(ERROR, "Server") << "ERROR in handle_pull_variants: " << e.what() << std::endl;
         res.status = 500;
